@@ -1,0 +1,362 @@
+#pragma once
+
+#include "../config.h"
+#include "../common/common.hpp"
+#include <kernel/pipeline/pipeline_builder.h>
+
+namespace kernel {
+
+class PipelineAnalysis : public PipelineCommonGraphFunctions {
+public:
+
+    using KernelPartitionIds = flat_map<ProgramGraph::vertex_descriptor, unsigned>;
+
+    using RedundantStreamSetMap = flat_map<const StreamSet *, StreamSet *>;
+
+    static PipelineAnalysis analyze(KernelBuilder & b, PipelineKernel * const pipelineKernel) {
+
+        PipelineAnalysis P(pipelineKernel);
+
+//SEED: 2622027106
+//SEED: 388749444
+
+        std::random_device rd;
+        //pipeline_random_engine rng{rd()};
+
+//        const unsigned seed = rd();
+        const unsigned seed = 388749444;
+        pipeline_random_engine rng{seed};
+
+//        P.generateRandomPipelineGraph(b, graphSeed, 50, 70, 10);
+
+        P.generateInitialPipelineGraph(b);
+
+
+        // Initially, we gather information about our partition to determine what kernels
+        // are within each partition in a topological order
+        auto initialGraph = P.generatePartitionGraph();
+
+        P.computeIntraPartitionRepetitionVectors(initialGraph);
+
+        P.simpleSchedulePartitionedProgram(initialGraph, rng);
+
+        // Construct the Stream and Scalar graphs
+        P.transcribeRelationshipGraph(initialGraph);
+
+        P.generateInitialBufferGraph(b);
+
+        P.updateInterPartitionThreadLocalBuffers();
+
+        P.calculateRelativeToInputDataTransferIORates();
+
+        P.identifyOutputNodeIds();
+
+        P.identifyInterPartitionSymbolicRates();
+
+        P.identifyTerminationChecks();
+
+        P.makeTerminationPropagationGraph();
+
+        P.analyzePrincipalRateIO();
+
+        P.determinePartitionJumpIndices();
+
+        P.annotateBufferGraphWithAddAttributes();
+
+        // Finish annotating the buffer graph
+        P.identifyOwnedBuffers();
+        P.identifyZeroExtendedStreamSets();
+
+        P.identifyLinearBuffers();
+        if (P.RequiresIllustratorObject) {
+            P.identifyIllustratedStreamSets();
+        }
+
+        P.estimateInitialBufferSizes(b);
+
+        P.makeConsumerGraph();
+
+        P.buildZeroInputGraph();
+
+        P.calculatePartialSumStepFactors(b);
+
+        P.identifyPortsThatModifySegmentLength();
+
+        P.mapInternallyGeneratedStreamSets();
+
+        // Finish the buffer graph
+
+        P.addStreamSetsToBufferGraph(b);
+
+        P.determineInitialThreadLocalBufferLayout(b, rng);
+
+        P.scanFamilyKernelBindings();
+
+        P.setStreamSetLockIds();
+
+        P.identifyManagedBufferStructIds(rng);
+
+        P.gatherInfo();
+
+        if (codegen::InfoOptionIsSet(codegen::PrintPipelineGraph)) {
+            assert (b.getModule() == pipelineKernel->getModule());
+            P.printBufferGraph(b, errs());
+        }
+
+        return P;
+    }
+
+private:
+
+    // constructor
+
+    PipelineAnalysis(PipelineKernel * const pipelineKernel)
+    : PipelineCommonGraphFunctions(mStreamGraph, mBufferGraph)
+    , mPipelineKernel(pipelineKernel)
+    , mKernels(pipelineKernel->mKernels)
+    , mTraceProcessedProducedItemCounts(codegen::StatisticsOptionIsSet(codegen::TraceCounts))
+    , mTraceDynamicBuffers(codegen::StatisticsOptionIsSet(codegen::TraceDynamicBuffers))
+    , mTraceIndividualConsumedItemCounts(mTraceProcessedProducedItemCounts || mTraceDynamicBuffers)
+    , IsNestedPipeline(pipelineKernel->hasAttribute(AttrId::InternallySynchronized))
+    , PreserveAllStreamSetData(parseCommaDelimitedList(codegen::PreserveAllStreamSetDataOptions)) {
+
+    }
+
+    // pipeline analysis functions
+
+    void generateInitialPipelineGraph(KernelBuilder & b);
+
+    void identifyPipelineInputs();
+
+    void transcribeRelationshipGraph(const PartitionGraph & partitionGraph);
+
+    void gatherInfo() {
+        MaxNumOfInputPorts = in_degree(PipelineOutput, mBufferGraph);
+        MaxNumOfOutputPorts = out_degree(PipelineInput, mBufferGraph);
+        for (auto i = FirstKernel; i <= LastKernel; ++i) {
+            MaxNumOfInputPorts = std::max<unsigned>(MaxNumOfInputPorts, in_degree(i, mBufferGraph));
+            MaxNumOfOutputPorts = std::max<unsigned>(MaxNumOfOutputPorts, out_degree(i, mBufferGraph));
+        }
+    }
+
+    static void addKernelRelationshipsInReferenceOrdering(const unsigned kernel, const RelationshipGraph & G,
+                                                          std::function<void(PortType, unsigned, unsigned)> insertionFunction);
+
+
+    // partitioning analysis
+    PartitionGraph generatePartitionGraph();
+
+    PartitionGraph identifyKernelPartitions();
+
+    void determinePartitionJumpIndices();
+
+    // simple scheduling analysis
+
+    void simpleSchedulePartitionedProgram(PartitionGraph & P, pipeline_random_engine & rng);
+
+    // scheduling analysis
+
+    void schedulePartitionedProgram(PartitionGraph & P, pipeline_random_engine & rng);
+
+    void analyzeDataflowWithinPartitions(PartitionGraph & P, pipeline_random_engine & rng) const;
+
+    SchedulingGraph makeIntraPartitionSchedulingGraph(const PartitionGraph & P, const unsigned currentPartitionId) const;
+
+    PartitionDependencyGraph makePartitionDependencyGraph(const unsigned numOfKernels, const SchedulingGraph & S) const;
+
+    OrderingDAWG scheduleProgramGraph(const PartitionGraph & P, pipeline_random_engine & rng) const;
+
+    OrderingDAWG assembleFullSchedule(const PartitionGraph & P, const OrderingDAWG & partial) const;
+
+    std::vector<unsigned> selectScheduleFromDAWG(const OrderingDAWG & schedule) const;
+
+    void addSchedulingConstraints(const std::vector<unsigned> & program);
+
+    static bool isNonSynchronousRate(const Binding & binding);
+
+    // buffer management analysis functions
+
+    void addStreamSetsToBufferGraph(KernelBuilder & b);
+
+    void generateInitialBufferGraph(KernelBuilder & b);
+
+    void estimateInitialBufferSizes(KernelBuilder & b);
+
+    void identifyOwnedBuffers();
+
+    void identifyLinearBuffers();
+
+    void identifyOutputNodeIds();
+
+    void identifyPortsThatModifySegmentLength();
+
+    void identifyIllustratedStreamSets();
+
+    void buildZeroInputGraph();
+
+    void setStreamSetLockIds();
+
+    void identifyManagedBufferStructIds(pipeline_random_engine & rng);
+
+    // thread local analysis
+
+    void determineInitialThreadLocalBufferLayout(KernelBuilder & b, pipeline_random_engine & rng);
+
+    void updateInterPartitionThreadLocalBuffers();
+
+    // consumer analysis functions
+
+    void makeConsumerGraph();
+
+    // dataflow analysis functions
+    void computeIntraPartitionRepetitionVectors(PartitionGraph & P);
+    void estimateInterPartitionDataflow(PartitionGraph & P, pipeline_random_engine & rng);
+
+    void computeMinimumExpectedDataflow(PartitionGraph & P);
+
+    void identifyInterPartitionSymbolicRates();
+
+    void calculatePartialSumStepFactors(KernelBuilder & b);
+
+    void calculateRelativeToInputDataTransferIORates();
+
+    void simpleEstimateInterPartitionDataflow(PartitionGraph & P, pipeline_random_engine & rng);
+
+    // princpal rate analysis functions
+
+    void analyzePrincipalRateIO();
+
+    // zero extension analysis function
+
+    void identifyZeroExtendedStreamSets();
+
+    // termination analysis functions
+
+    void identifyTerminationChecks();
+    void makeTerminationPropagationGraph();
+
+    // add(k) analysis functions
+
+    void annotateBufferGraphWithAddAttributes();
+
+    // Input truncation analysis functions
+
+    void makeInputTruncationGraph();
+
+    // Family analysis functions
+
+    void scanFamilyKernelBindings();
+
+    // Internally generated streamsets
+
+    void mapInternallyGeneratedStreamSets();
+
+public:
+
+    // Debug functions
+    void printBufferGraph(KernelBuilder & b, raw_ostream & out) const;
+
+    static void printRelationshipGraph(const RelationshipGraph & G, raw_ostream & out, const StringRef name = "G");
+
+public:
+
+    PipelineKernel * const          mPipelineKernel;
+    Kernels                         mKernels;
+    ProgramGraph                    Relationships;
+    KernelPartitionIds              PartitionIds;
+    std::vector<size_t>             PartitionPhaseBoundaries;
+    flat_map<size_t, size_t>        KernelPhaseId;
+
+    const bool                      mTraceProcessedProducedItemCounts;
+    const bool                      mTraceDynamicBuffers;
+    const bool                      mTraceIndividualConsumedItemCounts;
+    const bool                      IsNestedPipeline;
+
+    static const unsigned           PipelineInput = 0;
+    unsigned                        FirstKernel = 0;
+    unsigned                        LastKernel = 0;
+    unsigned                        PipelineOutput = 0;
+    unsigned                        FirstStreamSet = 0;
+    unsigned                        LastStreamSet = 0;
+    unsigned                        FirstBinding = 0;
+    unsigned                        LastBinding = 0;
+    unsigned                        FirstCall = 0;
+    unsigned                        LastCall = 0;
+    unsigned                        FirstScalar = 0;
+    unsigned                        LastScalar = 0;
+    unsigned                        PartitionCount = 0;
+    unsigned                        ManagedBufferStructCount = 0;
+
+    bool                            HasZeroExtendedStream = false;
+    bool                            RequiresIllustratorObject = false;
+
+    unsigned                        MaxNumOfInputPorts = 0;
+    unsigned                        MaxNumOfOutputPorts = 0;
+
+    RelationshipGraph               mStreamGraph;
+    RelationshipGraph               mScalarGraph;
+
+    KernelIdVector                  KernelPartitionId;
+    KernelIdVector                  FirstKernelInPartition;
+    std::vector<unsigned>           MinimumNumOfStrides;
+    std::vector<unsigned>           MaximumNumOfStrides;
+    std::vector<unsigned>           StrideRepetitionVector;
+    std::vector<unsigned>           TerminalPhaseSet;
+
+    BufferGraph                     mBufferGraph;
+    InOutGraph                      InOutStreamSetReplacement;
+    ThreadLocalPlacementGraph       ThreadLocalPlacement;
+
+    ThreadLocalConflictGraphType    ThreadLocalConflictGraph;
+
+    std::vector<unsigned>           PartitionJumpTargetId;
+    RedundantStreamSetMap           RemappedStreamSets;
+
+    ConsumerGraph                   mConsumerGraph;
+
+    PartialSumStepFactorGraph       mPartialSumStepFactorGraph;
+
+    flat_set<unsigned>              mNonThreadLocalStreamSets;
+
+    TerminationChecks               mTerminationCheck;
+
+    TerminationPropagationGraph         mTerminationPropagationGraph;
+    InternallyGeneratedStreamSetGraph   mInternallyGeneratedStreamSetGraph;
+    BitVector                           HasTerminationSignal;
+    std::vector<unsigned>               SynchronizationVariableNumber;
+
+    FamilyScalarGraph               mFamilyScalarGraph;
+    ZeroInputGraph                  mZeroInputGraph;
+
+    IntervalSet                     PreserveAllStreamSetData;
+
+    IllustratedStreamSetMap         mIllustratedStreamSetBindings;
+
+    OwningVector<Kernel>            mInternalKernels;
+    OwningVector<Binding>           mInternalBindings;
+    OwningVector<StreamSetBuffer>   mInternalBuffers;
+};
+
+/** ------------------------------------------------------------------------------------------------------------- *
+ * @brief printGraph
+ ** ------------------------------------------------------------------------------------------------------------- */
+template <typename Graph>
+void printGraph(const Graph & G, raw_ostream & out, const StringRef name = "G") {
+
+    out << "digraph \"" << name << "\" {\n";
+    for (auto v : make_iterator_range(vertices(G))) {
+        out << "v" << v << " [label=\"" << v << "\"];\n";
+    }
+    for (auto e : make_iterator_range(edges(G))) {
+        const auto s = source(e, G);
+        const auto t = target(e, G);
+        out << "v" << s << " -> v" << t << ";\n";
+    }
+
+    out << "}\n\n";
+    out.flush();
+}
+
+
+}
+
