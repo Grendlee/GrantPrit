@@ -1,0 +1,11 @@
+parabix_add_executable(
+NAME
+    utf8validate
+SRC
+    utf8validate.cpp
+    utf8_validation_kernel.cpp
+DEPS
+    kernel.io
+    kernel.pipeline
+    kernel.util
+)

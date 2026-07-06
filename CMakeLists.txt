@@ -443,6 +443,7 @@ if (GENERATE_TOOLS)
     add_subdirectory(tools/util)
     add_subdirectory(tools/csv)
     add_subdirectory(tools/utf8-study)
+    add_subdirectory(Update2Work)
 endif()
 
 # Kernel Tests
