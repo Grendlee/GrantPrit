@@ -33,10 +33,16 @@ void UTF8ValidationKernel::generateMultiBlockLogic(KernelBuilder & b, Value * co
     const unsigned blocksPerStride = (getStride() * 8) / b.getBitBlockWidth();
 
     Value * const v80 = b.simd_fill(8, b.getInt8(0x80));
+    Value * const v8F = b.simd_fill(8, b.getInt8(0x8F));
+    Value * const v90 = b.simd_fill(8, b.getInt8(0x90));
+    Value * const v9F = b.simd_fill(8, b.getInt8(0x9F));
+    Value * const vA0 = b.simd_fill(8, b.getInt8(0xA0));
     Value * const vC0 = b.simd_fill(8, b.getInt8(0xC0));
     Value * const vC1 = b.simd_fill(8, b.getInt8(0xC1));
     Value * const vE0 = b.simd_fill(8, b.getInt8(0xE0));
+    Value * const vED = b.simd_fill(8, b.getInt8(0xED));
     Value * const vF0 = b.simd_fill(8, b.getInt8(0xF0));
+    Value * const vF4 = b.simd_fill(8, b.getInt8(0xF4));
     Value * const vF5 = b.simd_fill(8, b.getInt8(0xF5));
 
     Value * const numBlocks = b.CreateMul(numOfStrides, b.getSize(blocksPerStride));
@@ -70,6 +76,18 @@ void UTF8ValidationKernel::generateMultiBlockLogic(KernelBuilder & b, Value * co
     mustCont = b.simd_or(mustCont, b.simd_uge(8, prev3, vF0));
 
     Value * err = b.simd_xor(isCont, mustCont);
+
+    // Tight second-byte ranges reject overlong encodings, UTF-16 surrogates,
+    // and code points above U+10FFFF. prev1 carries across SIMD blocks.
+    Value * rangeErr = b.simd_and(b.simd_eq(8, prev1, vE0), b.simd_ult(8, curr, vA0));
+    Value * const surrogateErr = b.simd_and(b.simd_eq(8, prev1, vED), b.simd_ugt(8, curr, v9F));
+    rangeErr = b.simd_or(rangeErr, surrogateErr);
+    Value * const f0OverlongErr = b.simd_and(b.simd_eq(8, prev1, vF0), b.simd_ult(8, curr, v90));
+    rangeErr = b.simd_or(rangeErr, f0OverlongErr);
+    Value * const outOfRangeErr = b.simd_and(b.simd_eq(8, prev1, vF4), b.simd_ugt(8, curr, v8F));
+    rangeErr = b.simd_or(rangeErr, outOfRangeErr);
+    err = b.simd_or(err, rangeErr);
+
     // bytes that can never appear in valid utf-8
     Value * illegal = b.simd_eq(8, curr, vC0);
     illegal = b.simd_or(illegal, b.simd_eq(8, curr, vC1));
