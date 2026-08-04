@@ -4,7 +4,10 @@ NAME
 SRC
     utf8validate.cpp
     utf8_validation_kernel.cpp
+    utf8_pablo_validation_kernel.cpp
 DEPS
+    grep
+    kernel.basis
     kernel.io
     kernel.pipeline
     kernel.util

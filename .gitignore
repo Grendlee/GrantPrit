@@ -42,3 +42,6 @@ projUpdate2/
 
 # Don't track Update2Docs directory
 Update2Docs/
+
+# Local artifact rendering workspace
+/tmp/

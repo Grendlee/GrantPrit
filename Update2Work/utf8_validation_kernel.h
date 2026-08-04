@@ -4,11 +4,12 @@
 
 namespace kernel {
 
-class UTF8ValidationKernel final : public MultiBlockKernel {
+class UTF8ValidationKernel final : public BlockOrientedKernel {
 public:
     UTF8ValidationKernel(LLVMTypeSystemInterface & ts, StreamSet * byteStream);
 private:
-    void generateMultiBlockLogic(KernelBuilder & b, llvm::Value * const numOfStrides) override;
+    void generateDoBlockMethod(KernelBuilder & b) override;
+    void generateFinalBlockMethod(KernelBuilder & b, llvm::Value * remainingItems) override;
 };
 
 }
