@@ -15,7 +15,7 @@ UTF8PabloValidationKernel::UTF8PabloValidationKernel(
         LLVMTypeSystemInterface & ts, StreamSet * basisBits, StreamSet * errors)
 : PabloKernel(ts, "UTF8PabloValidation",
               {Binding{"basis", basisBits}},
-              {Binding{"errors", errors, FixedRate(), Add1()}}) {
+              {Binding{"errors", errors}}) {
 }
 
 void UTF8PabloValidationKernel::generatePabloMethod() {
@@ -38,8 +38,9 @@ void UTF8PabloValidationKernel::generatePabloMethod() {
         pb.createOr(scope32, pb.createOr(scope33,
         pb.createOr(scope42, pb.createOr(scope43, scope44)))));
 
-    // Compare only real byte positions.  A separate Add1-position error marks
-    // an expected continuation exactly at EOF.
+    // Compare only real byte positions.  Truncation at EOF is detected by
+    // UTF8EOFDeficitKernel's continuation-count shortfall instead of an
+    // Add1-position marker, which does not survive multi-segment input.
     PabloAST * errors = pb.createXor(pb.createInFile(anyScope), suffix);
     errors = pb.createOr(errors, ccc.compileCC(makeByte(0xC0, 0xC1), pb));
     errors = pb.createOr(errors, ccc.compileCC(makeByte(0xF5, 0xFF), pb));
@@ -56,7 +57,6 @@ void UTF8PabloValidationKernel::generatePabloMethod() {
                                                ccc.compileCC(makeByte(0x80, 0x8F), pb)));
     errors = pb.createOr(errors, pb.createAnd(pb.createAdvance(f4, 1),
                                                ccc.compileCC(makeByte(0x90, 0xBF), pb)));
-    errors = pb.createOr(errors, pb.createAtEOF(anyScope), "errorsWithEOF");
 
     Var * const output = getOutputStreamVar("errors");
     pb.createAssign(pb.createExtract(output, pb.getInteger(0)), errors);
@@ -92,7 +92,7 @@ void UTF8EOFKernel::generatePabloMethod() {
 UTF8ErrorCountKernel::UTF8ErrorCountKernel(LLVMTypeSystemInterface & ts,
         StreamSet * errors, Scalar * countResult)
 : PabloKernel(ts, "UTF8ErrorCount",
-              {Binding{"errors", errors, FixedRate(), Add1()}}, {}, {},
+              {Binding{"errors", errors}}, {}, {},
               {Binding{"countResult", countResult}}) {
 }
 

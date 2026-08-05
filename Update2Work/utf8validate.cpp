@@ -1,11 +1,14 @@
 #include <toolchain/toolchain.h>
 #include <kernel/pipeline/driver/cpudriver.h>
 #include <kernel/io/source_kernel.h>
+#include <chrono>
+#include <algorithm>
 #include <kernel/basis/s2p_kernel.h>
 #include <kernel/core/kernel_builder.h>
 #include <kernel/pipeline/program_builder.h>
 #include "utf8_validation_kernel.h"
 #include "utf8_pablo_validation_kernel.h"
+#include "utf8_validation_lookup_kernel.h"
 #include <llvm/Support/CommandLine.h>
 #include <iostream>
 #include <vector>
@@ -18,7 +21,12 @@ using namespace kernel;
 
 static cl::OptionCategory u8vOptions("utf8validate Options", "UTF-8 validation options.");
 static cl::list<std::string> inputFiles(cl::Positional, cl::desc("<input file ...>"), cl::OneOrMore, cl::cat(u8vOptions));
-static cl::opt<std::string> algorithm("algorithm", cl::desc("Validation algorithm: direct or pablo"),
+// -bench=N times the pipeline over an already-loaded buffer, N times, and
+// reports median ns/byte.  No file read inside the timed region, so the number
+// is comparable with bench/lemire_bench --iters=N.
+static cl::opt<unsigned> benchIters("bench", cl::desc("Benchmark: re-run the pipeline N times per file over an in-memory buffer and report median ns/byte."), cl::init(0), cl::cat(u8vOptions));
+static cl::opt<bool> benchSamples("bench-samples", cl::desc("With -bench, print every individual trial so median and IQR can be recomputed from raw data."), cl::init(false), cl::cat(u8vOptions));
+static cl::opt<std::string> algorithm("algorithm", cl::desc("Validation algorithm: direct, pablo, or lookup"),
                                      cl::init("direct"), cl::cat(u8vOptions));
 
 static std::vector<uint64_t> errorCounts;
@@ -35,36 +43,157 @@ extern "C" {
 
 typedef void (*ValidateFunctionType)(uint32_t fd, uint32_t fileIdx);
 
+// Does the file end in the middle of a sequence?
+//
+// This is a property of the final few bytes and the file length, nothing else,
+// so it is decided here in O(1) rather than in the pipeline.  Detecting it with
+// a stream kernel costs a pass over every byte, and doing it with an Add1/AtEOF
+// output position overruns the buffer once the pipeline runs more than one
+// segment.  Deciding it from the length also means it does not care whether the
+// length happens to be an exact multiple of the block size, which was the
+// original defect.
+static uint64_t endsMidSequence(const unsigned char * tail, size_t tailLen, uint64_t fileLength) {
+    for (size_t back = 1; back <= tailLen && back <= 4; ++back) {
+        const unsigned char c = tail[tailLen - back];
+        if (c < 0x80) return 0;             // ASCII: complete
+        if (c < 0xC0) continue;             // continuation: keep looking back
+        size_t needed;
+        if (c < 0xE0) needed = 2;
+        else if (c < 0xF0) needed = 3;
+        else needed = 4;
+        // "back" bytes of this sequence are present at the end of the file
+        return (back < needed) ? 1 : 0;
+    }
+    (void) fileLength;
+    return 0;                               // no lead in the last 4 bytes
+}
+
+static uint64_t eofErrorForBuffer(const char * data, size_t length) {
+    if (length == 0) return 0;
+    const size_t tailLen = (length < 4) ? length : 4;
+    return endsMidSequence(reinterpret_cast<const unsigned char *>(data) + (length - tailLen),
+                           tailLen, length);
+}
+
+
+// Everything after the source kernel, shared by the file and in-memory
+// pipelines so that -bench measures exactly the configuration that is tested.
+template <typename PipelineT>
+static void buildValidation(PipelineT & P, StreamSet * ByteStream, Scalar * fileIdx) {
+    Scalar * errorCount = nullptr;
+    if (algorithm == "direct") {
+        Kernel * const validator = P.template CreateKernelCall<UTF8ValidationKernel>(ByteStream);
+        errorCount = validator->getOutputScalarAt(0);
+        P.CreateCall("record_result", record_result, {errorCount, fileIdx});
+    } else if (algorithm == "lookup") {
+        // Keiser-Lemire table lookups expressed with portable mvmd_shuffle.
+        // Shares the direct path's EOF guard so the two differ only in the
+        // in-file validation logic.
+        Kernel * const validator = P.template CreateKernelCall<UTF8ValidationLookupKernel>(ByteStream);
+        errorCount = validator->getOutputScalarAt(0);
+        P.CreateCall("record_result", record_result, {errorCount, fileIdx});
+    } else if (algorithm == "pablo") {
+        StreamSet * const BasisBits = P.CreateStreamSet(8);
+        Selected_S2P(P, ByteStream, BasisBits);
+        StreamSet * const Errors = P.CreateStreamSet(1);
+        P.template CreateKernelCall<UTF8PabloValidationKernel>(BasisBits, Errors);
+        errorCount = P.CreateScalar(P.getInt64Ty());
+        P.template CreateKernelCall<UTF8ErrorCountKernel>(Errors, errorCount);
+        P.CreateCall("record_result", record_result, {errorCount, fileIdx});
+    } else {
+        llvm::report_fatal_error("utf8validate: --algorithm must be direct, pablo, or lookup");
+    }
+}
+
 auto pipelineGen(CPUDriver & driver) {
     auto P = CreatePipeline(driver, Input<uint32_t>("fd"), Input<uint32_t>("fileIdx"));
     Scalar * const fileDescriptor = P.getInputScalar("fd");
     Scalar * const fileIdx = P.getInputScalar("fileIdx");
     StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
     P.CreateKernelCall<ReadSourceKernel>(fileDescriptor, ByteStream);
-    Scalar * errorCount = nullptr;
-    if (algorithm == "direct") {
-        Kernel * const validator = P.CreateKernelCall<UTF8ValidationKernel>(ByteStream);
-        errorCount = validator->getOutputScalarAt(0);
-        StreamSet * const EOFErrors = P.CreateStreamSet(1);
-        P.CreateKernelCall<UTF8EOFKernel>(ByteStream, EOFErrors);
-        Scalar * const eofErrorCount = P.CreateScalar(P.getInt64Ty());
-        P.CreateKernelCall<UTF8ErrorCountKernel>(EOFErrors, eofErrorCount);
-        P.CreateCall("record_direct_result", record_direct_result,
-                     {errorCount, eofErrorCount, fileIdx});
-    } else if (algorithm == "pablo") {
-        StreamSet * const BasisBits = P.CreateStreamSet(8);
-        Selected_S2P(P, ByteStream, BasisBits);
-        StreamSet * const Errors = P.CreateStreamSet(1);
-        P.CreateKernelCall<UTF8PabloValidationKernel>(BasisBits, Errors);
-        errorCount = P.CreateScalar(P.getInt64Ty());
-        P.CreateKernelCall<UTF8ErrorCountKernel>(Errors, errorCount);
-    } else {
-        llvm::report_fatal_error("utf8validate: --algorithm must be direct or pablo");
-    }
-    if (algorithm == "pablo") {
-        P.CreateCall("record_result", record_result, {errorCount, fileIdx});
-    }
+    buildValidation(P, ByteStream, fileIdx);
     return P.compile();
+}
+
+auto pipelineGenMem(CPUDriver & driver) {
+    auto P = CreatePipeline(driver, Input<const char *>{"buffer"}, Input<size_t>{"length"},
+                            Input<uint32_t>("fileIdx"));
+    Scalar * const buffer = P.getInputScalar("buffer");
+    Scalar * const length = P.getInputScalar("length");
+    Scalar * const fileIdx = P.getInputScalar("fileIdx");
+    StreamSet * const ByteStream = P.CreateStreamSet(1, 8);
+    P.CreateKernelCall<MemorySourceKernel>(buffer, length, ByteStream);
+    buildValidation(P, ByteStream, fileIdx);
+    return P.compile();
+}
+
+typedef void (*ValidateMemFn)(const char * buffer, size_t length, uint32_t fileIdx);
+
+static std::vector<char> slurp(const std::string & path) {
+    std::vector<char> buf;
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd == -1) return buf;
+    struct stat st;
+    if (fstat(fd, &st) == 0) {
+        buf.resize(st.st_size);
+        ssize_t got = 0;
+        while (got < st.st_size) {
+            const ssize_t n = read(fd, buf.data() + got, st.st_size - got);
+            if (n <= 0) break;
+            got += n;
+        }
+        buf.resize(got);
+    }
+    close(fd);
+    // MemorySourceKernel does not present a trailing partial block to the
+    // kernels, so the last few bytes would go unvalidated -- which both hides
+    // real errors there and creates a phantom continuation shortfall.  Pad up
+    // to a whole number of blocks with NULs.  NUL is valid UTF-8 and is not a
+    // lead or a continuation, so it changes no verdict, and a sequence
+    // truncated at the true end of file is still reported because the NULs
+    // that follow it are not continuations.
+    const size_t block = 4096;
+    const size_t padded = ((buf.size() + block - 1) / block) * block;
+    buf.resize(padded, '\0');
+    return buf;
+}
+
+static int runBench(CPUDriver & driver) {
+    auto memFn = pipelineGenMem(driver);
+    for (unsigned i = 0; i < inputFiles.size(); ++i) {
+        struct stat st;
+        const bool haveSize = (stat(inputFiles[i].c_str(), &st) == 0);
+        std::vector<char> data = slurp(inputFiles[i]);
+        if (data.empty()) {
+            std::cout << inputFiles[i] << ": ERROR (could not read)\n";
+            continue;
+        }
+        // time against the padded buffer, but report ns/byte over real bytes
+        const double nbytes = haveSize ? double(st.st_size) : double(data.size());
+        std::vector<double> samples;
+        samples.reserve(benchIters);
+        for (unsigned k = 0; k < benchIters; ++k) {
+            const auto t0 = std::chrono::steady_clock::now();
+            memFn(data.data(), data.size(), i);
+            const auto t1 = std::chrono::steady_clock::now();
+            samples.push_back(std::chrono::duration<double, std::nano>(t1 - t0).count() / nbytes);
+        }
+        errorCounts[i] += eofErrorForBuffer(data.data(), size_t(nbytes));
+        if (benchSamples) {
+            for (unsigned k = 0; k < samples.size(); ++k) {
+                std::cout << inputFiles[i] << "  trial=" << (k + 1)
+                          << "  ns_per_byte=" << samples[k]
+                          << "  gb_per_s=" << (1.0 / samples[k]) << "\n";
+            }
+        }
+        std::sort(samples.begin(), samples.end());
+        const double med = samples[samples.size() / 2];
+        std::cout << inputFiles[i] << "  bytes=" << size_t(nbytes)
+                  << "  " << (errorCounts[i] == 0 ? "VALID" : "INVALID")
+                  << "  median_ns/byte=" << med << "  GB/s=" << (1.0 / med)
+                  << "  (iters=" << benchIters << ")\n";
+    }
+    return 0;
 }
 
 void validate(ValidateFunctionType fn_ptr, const uint32_t fileIdx) {
@@ -76,15 +205,25 @@ void validate(ValidateFunctionType fn_ptr, const uint32_t fileIdx) {
     }
     opened[fileIdx] = true;
     fn_ptr(fd, fileIdx);
+    // EOF truncation is decided from the tail bytes, independent of the pipeline
+    struct stat st;
+    if (fstat(fd, &st) == 0 && st.st_size > 0) {
+        const size_t tailLen = (st.st_size < 4) ? size_t(st.st_size) : size_t(4);
+        unsigned char tail[4];
+        if (pread(fd, tail, tailLen, st.st_size - tailLen) == ssize_t(tailLen)) {
+            errorCounts[fileIdx] += endsMidSequence(tail, tailLen, uint64_t(st.st_size));
+        }
+    }
     close(fd);
 }
 
 int main(int argc, char *argv[]) {
     codegen::ParseCommandLineOptions(argc, argv, {&u8vOptions, codegen::codegen_flags()});
     CPUDriver driver("utf8validate");
-    auto fn_ptr = pipelineGen(driver);
     errorCounts.assign(inputFiles.size(), 0);
     opened.assign(inputFiles.size(), false);
+    if (benchIters > 0) return runBench(driver);
+    auto fn_ptr = pipelineGen(driver);
     for (unsigned i = 0; i < inputFiles.size(); ++i) {
         validate(fn_ptr, i);
     }

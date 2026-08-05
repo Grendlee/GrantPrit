@@ -45,3 +45,6 @@ Update2Docs/
 
 # Local artifact rendering workspace
 /tmp/
+
+# Deliverables live outside the repo (~/Desktop/479/final); ignore if copied in
+final/

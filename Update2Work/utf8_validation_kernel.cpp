@@ -7,7 +7,7 @@ using namespace llvm;
 namespace kernel {
 
 UTF8ValidationKernel::UTF8ValidationKernel(LLVMTypeSystemInterface & ts, StreamSet * byteStream)
-: BlockOrientedKernel(ts, "UTF8Validation",
+: MultiBlockKernel(ts, "UTF8Validation",
 {Binding{"byteStream", byteStream}},
 {},
 {},
@@ -16,10 +16,21 @@ UTF8ValidationKernel::UTF8ValidationKernel(LLVMTypeSystemInterface & ts, StreamS
     addInternalScalar(ts.getBitBlockType(), "pending");
 }
 
-void UTF8ValidationKernel::generateDoBlockMethod(KernelBuilder & b) {
+void UTF8ValidationKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) {
+
+    BasicBlock * const entry = b.GetInsertBlock();
+    BasicBlock * const loop = b.CreateBasicBlock("u8v_loop");
+    BasicBlock * const exit = b.CreateBasicBlock("u8v_exit");
 
     Type * const sizeTy = b.getSizeTy();
+    Type * const blockTy = b.getBitBlockType();
     Value * const i32Zero = b.getInt32(0);
+    ConstantInt * const ZERO = b.getSize(0);
+    ConstantInt * const ONE = b.getSize(1);
+    ConstantInt * const THREE = b.getSize(3);
+    ConstantInt * const SEVEN = b.getSize(7);
+
+    const unsigned blocksPerStride = (getStride() * 8) / b.getBitBlockWidth();
 
     Value * const v80 = b.simd_fill(8, b.getInt8(0x80));
     Value * const v8F = b.simd_fill(8, b.getInt8(0x8F));
@@ -34,9 +45,27 @@ void UTF8ValidationKernel::generateDoBlockMethod(KernelBuilder & b) {
     Value * const vF4 = b.simd_fill(8, b.getInt8(0xF4));
     Value * const vF5 = b.simd_fill(8, b.getInt8(0xF5));
 
-    Value * const currBlock = b.loadInputStreamBlock("byteStream", i32Zero);
+    // Read the carry once here and write it once at exit.  Doing this per block
+    // instead loses the carry between kernel invocations, so every sequence
+    // straddling a stride boundary is misreported.
+    Value * const numBlocks = b.CreateMul(numOfStrides, b.getSize(blocksPerStride));
+    Value * const startPending = b.getScalarField("pending");
+    Value * const startCount = b.getScalarField("errorCount");
+
+    b.CreateBr(loop);
+    b.SetInsertPoint(loop);
+    PHINode * const blockNo = b.CreatePHI(sizeTy, 2);
+    blockNo->addIncoming(ZERO, entry);
+    PHINode * const pending = b.CreatePHI(blockTy, 2);
+    pending->addIncoming(startPending, entry);
+    PHINode * const count = b.CreatePHI(sizeTy, 2);
+    count->addIncoming(startCount, entry);
+
+    Value * const packIndex = b.CreateAnd(blockNo, SEVEN);
+    Value * const blockOffset = b.CreateLShr(blockNo, THREE);
+    Value * const currBlock = b.loadInputStreamPack("byteStream", i32Zero, packIndex, blockOffset);
     Value * const curr = b.fwCast(8, currBlock);
-    Value * const prev = b.fwCast(8, b.getScalarField("pending"));
+    Value * const prev = b.fwCast(8, pending);
 
     // each pos gets the byte 1/2/3 back, carrying in the tail of the last block
     Value * const prev1 = b.mvmd_dslli(8, curr, prev, 1);
@@ -69,15 +98,21 @@ void UTF8ValidationKernel::generateDoBlockMethod(KernelBuilder & b) {
 
     Value * const mask = b.hsimd_signmask(8, err);
     Value * const blockErrs = b.CreateZExtOrTrunc(b.CreatePopcount(mask), sizeTy);
-    b.setScalarField("errorCount", b.CreateAdd(b.getScalarField("errorCount"), blockErrs));
-    b.setScalarField("pending", currBlock);
-}
+    Value * const nextCount = b.CreateAdd(count, blockErrs);
 
-void UTF8ValidationKernel::generateFinalBlockMethod(KernelBuilder & b, Value * /* remainingItems */) {
-    // Always process the zero-padded terminal block.  When EOF is exactly on a
-    // block boundary this is a synthetic all-zero block; pending carries the
-    // preceding bytes into it, exposing any required continuations after EOF.
-    RepeatDoBlockLogic(b);
+    Value * const nextBlock = b.CreateAdd(blockNo, ONE);
+    blockNo->addIncoming(nextBlock, loop);
+    pending->addIncoming(currBlock, loop);
+    count->addIncoming(nextCount, loop);
+    b.CreateCondBr(b.CreateICmpULT(nextBlock, numBlocks), loop, exit);
+
+    b.SetInsertPoint(exit);
+    PHINode * const finalPending = b.CreatePHI(blockTy, 1);
+    finalPending->addIncoming(currBlock, loop);
+    PHINode * const finalCount = b.CreatePHI(sizeTy, 1);
+    finalCount->addIncoming(nextCount, loop);
+    b.setScalarField("pending", finalPending);
+    b.setScalarField("errorCount", finalCount);
 }
 
 }
