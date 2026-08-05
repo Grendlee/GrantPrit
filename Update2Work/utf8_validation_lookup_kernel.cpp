@@ -1,26 +1,47 @@
-#include "utf8_validation_kernel.h"
+#include "utf8_validation_lookup_kernel.h"
 #include <kernel/core/streamset.h>
 #include <kernel/core/kernel_builder.h>
+#include <llvm/IR/Constants.h>
+#include <array>
 
 using namespace llvm;
 
 namespace kernel {
 
-UTF8ValidationKernel::UTF8ValidationKernel(LLVMTypeSystemInterface & ts, StreamSet * byteStream)
-: MultiBlockKernel(ts, "UTF8Validation",
+UTF8ValidationLookupKernel::UTF8ValidationLookupKernel(LLVMTypeSystemInterface & ts, StreamSet * byteStream)
+: MultiBlockKernel(ts, "UTF8ValidationLookup",
 {Binding{"byteStream", byteStream}},
 {},
 {},
 {Binding{ts.getSizeTy(), "errorCount"}},
 {}) {
+
     addInternalScalar(ts.getBitBlockType(), "pending");
 }
 
-void UTF8ValidationKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) {
+static const std::array<uint8_t, 16> T1_byte1_high = {
+    0x02,0x02,0x02,0x02, 0x02,0x02,0x02,0x02,
+    0x80,0x80,0x80,0x80,
+    0x21,
+    0x01,
+    0x15,
+    0x49
+};
+static const std::array<uint8_t, 16> T2_byte1_low = {
+    0xE7,0xA3,0x83,0x83, 0x8B,0xCB,0xCB,0xCB,
+    0xCB,0xCB,0xCB,0xCB, 0xCB,0xDB,0xCB,0xCB
+};
+static const std::array<uint8_t, 16> T3_byte2_high = {
+    0x01,0x01,0x01,0x01, 0x01,0x01,0x01,0x01,
+    0xE6,0xAE,0xBA,0xBA,
+    0x01,0x01,0x01,0x01
+};
+
+void UTF8ValidationLookupKernel::generateMultiBlockLogic(KernelBuilder & b, Value * const numOfStrides) {
 
     BasicBlock * const entry = b.GetInsertBlock();
-    BasicBlock * const loop = b.CreateBasicBlock("u8v_loop");
-    BasicBlock * const exit = b.CreateBasicBlock("u8v_exit");
+    BasicBlock * const loop = b.CreateBasicBlock("u8vl_loop");
+    BasicBlock * const exit = b.CreateBasicBlock("u8vl_exit");
 
     Type * const sizeTy = b.getSizeTy();
     Type * const blockTy = b.getBitBlockType();
@@ -31,19 +52,24 @@ void UTF8ValidationKernel::generateMultiBlockLogic(KernelBuilder & b, Value * co
     ConstantInt * const SEVEN = b.getSize(7);
 
     const unsigned blocksPerStride = (getStride() * 8) / b.getBitBlockWidth();
+    const unsigned lanes = b.getBitBlockWidth() / 8;
 
+    auto makeTable = [&](const std::array<uint8_t, 16> & t) -> Value * {
+        SmallVector<Constant *, 64> vals(lanes);
+        for (unsigned i = 0; i < lanes; ++i) {
+            vals[i] = ConstantInt::get(b.getInt8Ty(), t[i % 16]);
+        }
+        return ConstantVector::get(vals);
+    };
+    Value * const T1 = makeTable(T1_byte1_high);
+    Value * const T2 = makeTable(T2_byte1_low);
+    Value * const T3 = makeTable(T3_byte2_high);
+
+    Value * const v0F = b.simd_fill(8, b.getInt8(0x0F));
     Value * const v80 = b.simd_fill(8, b.getInt8(0x80));
-    Value * const v8F = b.simd_fill(8, b.getInt8(0x8F));
-    Value * const v90 = b.simd_fill(8, b.getInt8(0x90));
-    Value * const v9F = b.simd_fill(8, b.getInt8(0x9F));
-    Value * const vA0 = b.simd_fill(8, b.getInt8(0xA0));
-    Value * const vC0 = b.simd_fill(8, b.getInt8(0xC0));
-    Value * const vC1 = b.simd_fill(8, b.getInt8(0xC1));
     Value * const vE0 = b.simd_fill(8, b.getInt8(0xE0));
-    Value * const vED = b.simd_fill(8, b.getInt8(0xED));
     Value * const vF0 = b.simd_fill(8, b.getInt8(0xF0));
-    Value * const vF4 = b.simd_fill(8, b.getInt8(0xF4));
-    Value * const vF5 = b.simd_fill(8, b.getInt8(0xF5));
+    Value * const zeroVec = Constant::getNullValue(b.fwVectorType(8));
 
     Value * const numBlocks = b.CreateMul(numOfStrides, b.getSize(blocksPerStride));
     Value * const startPending = b.getScalarField("pending");
@@ -64,36 +90,25 @@ void UTF8ValidationKernel::generateMultiBlockLogic(KernelBuilder & b, Value * co
     Value * const curr = b.fwCast(8, currBlock);
     Value * const prev = b.fwCast(8, pending);
 
-    // each pos gets the byte 1/2/3 back, carrying in the tail of the last block
     Value * const prev1 = b.mvmd_dslli(8, curr, prev, 1);
     Value * const prev2 = b.mvmd_dslli(8, curr, prev, 2);
     Value * const prev3 = b.mvmd_dslli(8, curr, prev, 3);
 
-    Value * const isCont = b.simd_and(b.simd_uge(8, curr, v80), b.simd_ult(8, curr, vC0));
-    Value * mustCont = b.simd_uge(8, prev1, vC0);
-    mustCont = b.simd_or(mustCont, b.simd_uge(8, prev2, vE0));
-    mustCont = b.simd_or(mustCont, b.simd_uge(8, prev3, vF0));
+    Value * const hiPrev1 = b.simd_srli(8, prev1, 4);
+    Value * const loPrev1 = b.simd_and(prev1, v0F);
+    Value * const hiCurr = b.simd_srli(8, curr, 4);
+    Value * const b1h = b.mvmd_shuffle(8, T1, hiPrev1);
+    Value * const b1l = b.mvmd_shuffle(8, T2, loPrev1);
+    Value * const b2h = b.mvmd_shuffle(8, T3, hiCurr);
+    Value * const sc = b.simd_and(b.simd_and(b1h, b1l), b2h);
 
-    Value * err = b.simd_xor(isCont, mustCont);
+    Value * must23 = b.simd_or(b.simd_uge(8, prev2, vE0), b.simd_uge(8, prev3, vF0));
+    must23 = b.simd_and(must23, v80);
 
-    // Tight second-byte ranges reject overlong encodings, UTF-16 surrogates,
-    // and code points above U+10FFFF. prev1 carries across SIMD blocks.
-    Value * rangeErr = b.simd_and(b.simd_eq(8, prev1, vE0), b.simd_ult(8, curr, vA0));
-    Value * const surrogateErr = b.simd_and(b.simd_eq(8, prev1, vED), b.simd_ugt(8, curr, v9F));
-    rangeErr = b.simd_or(rangeErr, surrogateErr);
-    Value * const f0OverlongErr = b.simd_and(b.simd_eq(8, prev1, vF0), b.simd_ult(8, curr, v90));
-    rangeErr = b.simd_or(rangeErr, f0OverlongErr);
-    Value * const outOfRangeErr = b.simd_and(b.simd_eq(8, prev1, vF4), b.simd_ugt(8, curr, v8F));
-    rangeErr = b.simd_or(rangeErr, outOfRangeErr);
-    err = b.simd_or(err, rangeErr);
+    Value * const errVec = b.simd_xor(must23, sc);
 
-    // bytes that can never appear in valid utf-8
-    Value * illegal = b.simd_eq(8, curr, vC0);
-    illegal = b.simd_or(illegal, b.simd_eq(8, curr, vC1));
-    illegal = b.simd_or(illegal, b.simd_uge(8, curr, vF5));
-    err = b.simd_or(err, illegal);
-
-    Value * const mask = b.hsimd_signmask(8, err);
+    Value * const errBool = b.simd_not(b.simd_eq(8, errVec, zeroVec));
+    Value * const mask = b.hsimd_signmask(8, errBool);
     Value * const blockErrs = b.CreateZExtOrTrunc(b.CreatePopcount(mask), sizeTy);
     Value * const nextCount = b.CreateAdd(count, blockErrs);
 

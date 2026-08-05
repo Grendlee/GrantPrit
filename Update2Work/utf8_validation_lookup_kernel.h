@@ -4,9 +4,9 @@
 
 namespace kernel {
 
-class UTF8ValidationKernel final : public MultiBlockKernel {
+class UTF8ValidationLookupKernel final : public MultiBlockKernel {
 public:
-    UTF8ValidationKernel(LLVMTypeSystemInterface & ts, StreamSet * byteStream);
+    UTF8ValidationLookupKernel(LLVMTypeSystemInterface & ts, StreamSet * byteStream);
 private:
     void generateMultiBlockLogic(KernelBuilder & b, llvm::Value * const numOfStrides) override;
 };
