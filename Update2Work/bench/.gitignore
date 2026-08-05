@@ -1,6 +1,4 @@
 lemire_bench
-results*.csv
-headline_variance.csv
 results*.summary.json
 figures/
 make_figures.py
