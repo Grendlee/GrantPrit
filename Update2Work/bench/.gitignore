@@ -1,0 +1,6 @@
+lemire_bench
+results*.summary.json
+figures/
+make_figures.py
+make_poster.py
+make_poster_script.py
